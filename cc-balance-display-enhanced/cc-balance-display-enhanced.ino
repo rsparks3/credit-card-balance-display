@@ -12,15 +12,16 @@ const char* password = "WIFI PASSWORD";
 // 2. Enter your private SimpleFIN Access URL (WITHOUT the account=... part)
 const char* simplefin_access_url = "YOUR SIMPLEFIN URL/simplefin/accounts?";
 
-// 3. Enter your account IDs and their statement dates
+// 3. Enter your account IDs, their statement dates, and any notes
 struct AccountConfig {
   const char* id;
   int statement_day;
+  const char* note;
 };
 
 AccountConfig accounts[] = {
-  {"ACT-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", 24},
-  {"ACT-b2656bad-0bbb-4e15-9276-00ee15703411", 13}, // Adjust your second real ID and date here
+  {"ACT-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", 24, "Pay by the 18th"},
+  {"ACT-b2656bad-0bbb-4e15-9276-00ee15703411", 13, "Pay by the 10th"}, // Adjust your second real ID, date, and note here
 };
 const int NUM_ACCOUNTS = sizeof(accounts) / sizeof(accounts[0]);
 
@@ -165,7 +166,53 @@ void setup() {
   delay(2500); 
 
   Serial.println("Going to Deep Sleep...");
+  
+  // Set ESP32 internal timer wakeup for 12 hours as a solid fallback for USB power
   esp_sleep_enable_timer_wakeup(SLEEP_TIME);
+  
+  time_t now;
+  time(&now);
+  struct tm * timeinfo = localtime(&now);
+
+  // If time is valid (year > 2020), set an absolute RTC alarm to bypass the 255-minute limit 
+  // of the M5Paper BM8563 relative timer.
+  if (timeinfo->tm_year > 120) {
+    // Sync the hardware RTC with our NTP time
+    m5::rtc_date_t rtc_date;
+    rtc_date.year    = timeinfo->tm_year + 1900;
+    rtc_date.month   = timeinfo->tm_mon + 1;
+    rtc_date.date    = timeinfo->tm_mday;
+    rtc_date.weekDay = timeinfo->tm_wday;
+    
+    m5::rtc_time_t rtc_time;
+    rtc_time.hours   = timeinfo->tm_hour;
+    rtc_time.minutes = timeinfo->tm_min;
+    rtc_time.seconds = timeinfo->tm_sec;
+    
+    M5.Rtc.setDateTime(&rtc_date, &rtc_time);
+
+    // Calculate wakeup time precisely 12 hours from now
+    time_t wakeup_t = now + (12 * 60 * 60);
+    struct tm * wakeupinfo = localtime(&wakeup_t);
+
+    m5::rtc_date_t wake_date;
+    wake_date.date    = wakeupinfo->tm_mday;
+    wake_date.weekDay = wakeupinfo->tm_wday;
+    
+    m5::rtc_time_t wake_time;
+    wake_time.hours   = wakeupinfo->tm_hour;
+    wake_time.minutes = wakeupinfo->tm_min;
+
+    Serial.println("Using absolute RTC alarm for 12-hour true power-off.");
+    M5.Power.timerSleep(wake_date, wake_time);
+  } else {
+    // If no NTP time (e.g., Wi-Fi failed), fallback to max relative sleep (will cap around 4.25h)
+    Serial.println("No valid time. Using relative RTC timer (caps around 4.25 hours).");
+    M5.Power.timerSleep((int)(12 * 60 * 60));
+  }
+
+  // Fallback in case timerSleep fails to cut power (e.g. plugged into USB)
+  Serial.println("Fallback: entering ESP32 deep sleep.");
   esp_deep_sleep_start();
 }
 
@@ -209,9 +256,21 @@ void fetchAndDisplayBalance() {
 
   canvas.fillSprite(TFT_WHITE); 
 
-  // --- DRAW THE TITLE ---
+  // --- DRAW THE TITLE AND UPDATE TIME ---
   canvas.setTextSize(4);
   canvas.drawString("Romney & Ryan Finances", 50, 18);
+  
+  // Format and draw current time next to the title
+  time_t now;
+  time(&now);
+  struct tm * timeinfo = localtime(&now);
+  char updateTimeString[32];
+  strftime(updateTimeString, sizeof(updateTimeString), "Updated %m/%d", timeinfo);
+  
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_DARKGREY);
+  canvas.drawString(updateTimeString, 620, 25);
+  canvas.setTextColor(TFT_BLACK);
 
   // --- DRAW THE BATTERY ICON ---
   int batPercent = M5.Power.getBatteryLevel();
@@ -255,11 +314,15 @@ void fetchAndDisplayBalance() {
         const char* balanceStr = accountData["balance"];
         long balanceDate = accountData["balance-date"]; 
         
-        // Find statement date for this account
+        // Find statement date and note for this account
         int statement_day = 1; // fallback
+        String account_note = "";
         for (int i = 0; i < NUM_ACCOUNTS; i++) {
           if (String(accounts[i].id) == String(acctId)) {
             statement_day = accounts[i].statement_day;
+            if (accounts[i].note != nullptr) {
+              account_note = String(accounts[i].note);
+            }
             break;
           }
         }
@@ -294,11 +357,15 @@ void fetchAndDisplayBalance() {
           statement_balance = 0;
         }
 
-        // Format current time correctly
+        // Format current time and start date correctly
         time_t rawtime = (time_t)balanceDate;
         struct tm * timeinfo = localtime(&rawtime);
         char timeString[64];
-        strftime(timeString, sizeof(timeString), "as of %b %d (%I:%M %p)", timeinfo);
+        strftime(timeString, sizeof(timeString), "(data provided on %b %d at %I:%M %p)", timeinfo);
+        
+        struct tm * startinfo = localtime(&account_start_date);
+        char startString[64];
+        strftime(startString, sizeof(startString), "since %b %d (%d statement close)", startinfo);
 
         canvas.drawRoundRect(50, y_offset, 860, 200, 15, TFT_BLACK); 
         
@@ -309,10 +376,14 @@ void fetchAndDisplayBalance() {
         String mainAmountStr = formatBalanceFloat(this_month_balance);
         canvas.drawString(mainAmountStr, 80, y_offset + 55);
         
-        // Draw the "as of" time immediately after the balance amount in a smaller font
+        // Draw the "since" and "as of" time immediately after the balance amount in a smaller font
         int balanceWidth = canvas.textWidth(mainAmountStr);
         canvas.setTextSize(2);
-        canvas.drawString(timeString, 80 + balanceWidth + 15, y_offset + 90);
+        canvas.setTextColor(TFT_DARKGREY);
+        canvas.drawString(String(startString), 80 + balanceWidth + 15, y_offset + 70);
+        // canvas.setTextColor(TFT_DARKGREY);
+        canvas.drawString(timeString, 80 + balanceWidth + 15, y_offset + 95);
+        canvas.setTextColor(TFT_BLACK);
 
         if (statement_balance > 0.01) {
           canvas.setTextSize(2); 
@@ -324,6 +395,21 @@ void fetchAndDisplayBalance() {
               ", Ryan: " + formatBalanceFloat(ryan_share) + ")";
               
           canvas.drawString("Statement Bal: " + statementAmountStr, 80, y_offset + 140);
+        } else {
+            // Push note higher if there is no statement balance
+            y_offset -= 25; 
+        }
+        
+        if (account_note.length() > 0) {
+          canvas.setTextColor(TFT_BLACK); // Slightly lighter to distinguish as a note
+          canvas.setTextSize(2);
+          canvas.drawString(account_note, 80, y_offset + 165);
+          canvas.setTextColor(TFT_BLACK); // Reset
+        }
+
+        // Restore y_offset if we bumped it for the note layout
+        if (statement_balance <= 0.01) {
+            y_offset += 25;
         }
 
         // Move to the next card's starting Y position
