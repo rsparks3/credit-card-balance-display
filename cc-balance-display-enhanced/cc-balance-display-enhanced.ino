@@ -9,16 +9,28 @@
 const char* ssid = "WIFI SSID";
 const char* password = "WIFI PASSWORD";
 
-// 2. Enter your private SimpleFIN URL
-const char* private_url = "YOUR SIMPLEFIN URL/simplefin/accounts?account=ACT-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX";
+// 2. Enter your private SimpleFIN Access URL (WITHOUT the account=... part)
+const char* simplefin_access_url = "YOUR SIMPLEFIN URL/simplefin/accounts?";
+
+// 3. Enter your account IDs and their statement dates
+struct AccountConfig {
+  const char* id;
+  int statement_day;
+};
+
+AccountConfig accounts[] = {
+  {"ACT-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", 24},
+  {"ACT-b2656bad-0bbb-4e15-9276-00ee15703411", 13}, // Adjust your second real ID and date here
+};
+const int NUM_ACCOUNTS = sizeof(accounts) / sizeof(accounts[0]);
 
 // Time to sleep between checks (12 hours in microseconds)
 const uint64_t SLEEP_TIME = 12ULL * 60 * 60 * 1000000;
 
 M5Canvas canvas(&M5.Display);
 
-// --- HELPER FUNCTION: Get the 18th of current/previous month ---
-time_t getMostRecent18th() {
+// --- HELPER FUNCTION: Get the most recent statement date ---
+time_t getMostRecentDate(int target_day) {
   time_t now;
   time(&now);
   struct tm * timeinfo = localtime(&now);
@@ -28,12 +40,12 @@ time_t getMostRecent18th() {
   timeinfo->tm_min = 0;
   timeinfo->tm_sec = 0;
   
-  if (timeinfo->tm_mday >= 18) {
-    // Current month's 18th
-    timeinfo->tm_mday = 18;
+  if (timeinfo->tm_mday >= target_day) {
+    // Current month's target day
+    timeinfo->tm_mday = target_day;
   } else {
-    // Previous month's 18th
-    timeinfo->tm_mday = 18;
+    // Previous month's target day
+    timeinfo->tm_mday = target_day;
     timeinfo->tm_mon -= 1;
     if (timeinfo->tm_mon < 0) {
       timeinfo->tm_mon = 11;
@@ -165,9 +177,22 @@ void fetchAndDisplayBalance() {
   // Setup NTP to ensure correct time calculation
   setupTime();
 
-  // Create request URL with start-date
-  time_t mostRecent18th = getMostRecent18th();
-  String requestUrl = String(private_url) + "&start-date=" + String((unsigned long)mostRecent18th);
+  // Find the earliest start date among all configured accounts
+  time_t earliest_start = -1;
+  for (int i = 0; i < NUM_ACCOUNTS; i++) {
+    time_t acct_start = getMostRecentDate(accounts[i].statement_day);
+    if (earliest_start == -1 || acct_start < earliest_start) {
+      earliest_start = acct_start;
+    }
+  }
+
+  // Create request URL with the earliest start-date
+  String requestUrl = String(simplefin_access_url) + "&start-date=" + String((unsigned long)earliest_start);
+
+  // Append all account IDs to the query
+  for (int i = 0; i < NUM_ACCOUNTS; i++) {
+    requestUrl += "&account=" + String(accounts[i].id);
+  }
 
   Serial.println("Starting HTTPS connection to SimpleFIN...");
   WiFiClientSecure *client = new WiFiClientSecure;
@@ -183,6 +208,10 @@ void fetchAndDisplayBalance() {
   Serial.println(httpCode);
 
   canvas.fillSprite(TFT_WHITE); 
+
+  // --- DRAW THE TITLE ---
+  canvas.setTextSize(4);
+  canvas.drawString("Romney & Ryan Finances", 50, 18);
 
   // --- DRAW THE BATTERY ICON ---
   int batPercent = M5.Power.getBatteryLevel();
@@ -216,59 +245,90 @@ void fetchAndDisplayBalance() {
       canvas.drawString(error.c_str(), 50, 150);
     } else {
       Serial.println("JSON Parsed Successfully.");
-      JsonObject accountData = doc["accounts"][0];
+      // Loop through accounts and draw cards
+      int y_offset = 60; // Start high enough for multiple cards
       
-      const char* acctName = accountData["name"];
-      const char* balanceStr = accountData["balance"];
-      long balanceDate = accountData["balance-date"]; 
-      
-      Serial.print("Account: "); Serial.println(acctName);
-      Serial.print("Balance: "); Serial.println(balanceStr);
-
-      // --- CALCULATE BALANCES ---
-      float api_balance = atof(balanceStr);
-      float total_owed = -api_balance; // assuming negative means debt
-      float spend_since_18th = 0.0;
-
-      JsonArray transactions = accountData["transactions"];
-      for (JsonObject txn : transactions) {
-        float amt = atof(txn["amount"]);
-        if (amt < 0) {
-          // charge
-          spend_since_18th += (-amt);
+      JsonArray accountsArray = doc["accounts"];
+      for (JsonObject accountData : accountsArray) {
+        const char* acctId = accountData["id"];
+        const char* acctName = accountData["name"];
+        const char* balanceStr = accountData["balance"];
+        long balanceDate = accountData["balance-date"]; 
+        
+        // Find statement date for this account
+        int statement_day = 1; // fallback
+        for (int i = 0; i < NUM_ACCOUNTS; i++) {
+          if (String(accounts[i].id) == String(acctId)) {
+            statement_day = accounts[i].statement_day;
+            break;
+          }
         }
+        time_t account_start_date = getMostRecentDate(statement_day);
+
+        Serial.print("Account: "); Serial.println(acctName);
+        Serial.print("Balance: "); Serial.println(balanceStr);
+
+        // --- CALCULATE BALANCES ---
+        float api_balance = atof(balanceStr);
+        float total_owed = -api_balance; // assuming negative means debt
+        float spend_since_last_statement = 0.0;
+
+        JsonArray transactions = accountData["transactions"];
+        for (JsonObject txn : transactions) {
+          long posted = txn["posted"];
+          if (posted >= account_start_date) {
+            float amt = atof(txn["amount"]);
+            if (amt < 0) {
+              // charge
+              spend_since_last_statement += (-amt);
+            }
+          }
+        }
+
+        float statement_balance = total_owed - spend_since_last_statement;
+        float this_month_balance = spend_since_last_statement;
+
+        if (statement_balance < 0) {
+          // More payments made than statement debt
+          this_month_balance += statement_balance;
+          statement_balance = 0;
+        }
+
+        // Format current time correctly
+        time_t rawtime = (time_t)balanceDate;
+        struct tm * timeinfo = localtime(&rawtime);
+        char timeString[64];
+        strftime(timeString, sizeof(timeString), "as of %b %d (%I:%M %p)", timeinfo);
+
+        canvas.drawRoundRect(50, y_offset, 860, 200, 15, TFT_BLACK); 
+        
+        canvas.setTextSize(3); // Reduced slightly for better fit
+        canvas.drawString(acctName, 80, y_offset + 15);
+
+        canvas.setTextSize(7); // Reduced slightly for better fit
+        String mainAmountStr = formatBalanceFloat(this_month_balance);
+        canvas.drawString(mainAmountStr, 80, y_offset + 55);
+        
+        // Draw the "as of" time immediately after the balance amount in a smaller font
+        int balanceWidth = canvas.textWidth(mainAmountStr);
+        canvas.setTextSize(2);
+        canvas.drawString(timeString, 80 + balanceWidth + 15, y_offset + 90);
+
+        if (statement_balance > 0.01) {
+          canvas.setTextSize(2); 
+          float romney_share = statement_balance * 0.55;
+          float ryan_share = statement_balance * 0.45;
+          
+          String statementAmountStr = String(formatBalanceFloat(statement_balance)) + 
+              " (Romney: " + formatBalanceFloat(romney_share) + 
+              ", Ryan: " + formatBalanceFloat(ryan_share) + ")";
+              
+          canvas.drawString("Statement Bal: " + statementAmountStr, 80, y_offset + 140);
+        }
+
+        // Move to the next card's starting Y position
+        y_offset += 230; 
       }
-
-      float statement_balance = total_owed - spend_since_18th;
-      float this_month_balance = spend_since_18th;
-
-      if (statement_balance < 0) {
-        // More payments made than statement debt
-        this_month_balance += statement_balance;
-        statement_balance = 0;
-      }
-
-      // Format current time correctly
-      time_t rawtime = (time_t)balanceDate;
-      struct tm * timeinfo = localtime(&rawtime);
-      char timeString[64];
-      strftime(timeString, sizeof(timeString), "Balance as of %b %d, %Y (%I:%M %p)", timeinfo);
-
-      canvas.drawRoundRect(50, 80, 860, 220, 15, TFT_BLACK); 
-      
-      canvas.setTextSize(4);
-      canvas.drawString(acctName, 80, 100);
-      
-      canvas.setTextSize(8); 
-      String mainAmountStr = formatBalanceFloat(this_month_balance);
-      canvas.drawString(mainAmountStr, 80, 140);
-      
-      canvas.setTextSize(3);
-      String statementAmountStr = "Statement Bal: " + formatBalanceFloat(statement_balance);
-      canvas.drawString(statementAmountStr, 80, 215);
-      
-      canvas.setTextSize(2);
-      canvas.drawString(timeString, 80, 260);
     }
   } else {
     Serial.println("HTTP Request Failed.");
