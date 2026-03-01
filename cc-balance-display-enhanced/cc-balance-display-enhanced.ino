@@ -365,7 +365,7 @@ void fetchAndDisplayBalance() {
         
         struct tm * startinfo = localtime(&account_start_date);
         char startString[64];
-        strftime(startString, sizeof(startString), "since %b %d (%d statement close)", startinfo);
+        strftime(startString, sizeof(startString), "since %b %d (close of %b statement)", startinfo);
 
         canvas.drawRoundRect(50, y_offset, 860, 200, 15, TFT_BLACK); 
         
