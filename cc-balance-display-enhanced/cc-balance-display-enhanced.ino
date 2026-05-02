@@ -20,15 +20,76 @@ struct AccountConfig {
 };
 
 AccountConfig accounts[] = {
-  {"ACT-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", 24, "Pay by the 18th"},
+  {"ACT-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", 21, "Pay by the 18th"},
+  {"ACT-06ef6ad7-731b-4845-a40f-13c14dd7c353", 13, "Pay by the 10th"},
   {"ACT-b2656bad-0bbb-4e15-9276-00ee15703411", 13, "Pay by the 10th"}, // Adjust your second real ID, date, and note here
 };
 const int NUM_ACCOUNTS = sizeof(accounts) / sizeof(accounts[0]);
 
-// Time to sleep between checks (12 hours in microseconds)
-const uint64_t SLEEP_TIME = 12ULL * 60 * 60 * 1000000;
+// Fallback sleep duration if time is unavailable (12 hours in microseconds)
+const uint64_t FALLBACK_SLEEP_TIME_US = 12ULL * 60 * 60 * 1000000;
+const int HTTP_RETRY_DELAY_MS = 30000;
+const int MAX_HTTP_RETRY_ATTEMPTS = 5;
+const int HTTP_CONNECT_TIMEOUT_MS = 15000;
+const int HTTP_READ_TIMEOUT_MS = 20000;
+const int WIFI_RECONNECT_TIMEOUT_MS = 15000;
 
 M5Canvas canvas(&M5.Display);
+
+bool ensureWiFiConnected(unsigned long timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  Serial.println("Wi-Fi disconnected. Attempting reconnect...");
+  WiFi.disconnect();
+  delay(200);
+  WiFi.begin(ssid, password);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi reconnect successful.");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+
+  Serial.println("Wi-Fi reconnect failed.");
+  return false;
+}
+
+void drawRetryStatus(int httpCode, int attemptNumber, const String& reason) {
+  canvas.fillSprite(TFT_WHITE);
+  canvas.setTextColor(TFT_BLACK);
+  canvas.setTextSize(4);
+  canvas.drawString("HTTP error.", 50, 100);
+  canvas.drawString("Code: " + String(httpCode), 50, 150);
+  canvas.setTextSize(3);
+  canvas.drawString("Retrying in 30 seconds.", 50, 205);
+  canvas.setTextSize(2);
+  canvas.drawString("Attempt " + String(attemptNumber) + " of " + String(MAX_HTTP_RETRY_ATTEMPTS), 50, 245);
+  if (reason.length() > 0) {
+    canvas.drawString(reason, 50, 275);
+  }
+  canvas.pushSprite(0, 0);
+
+  Serial.print("HTTP retry scheduled after code ");
+  Serial.print(httpCode);
+  Serial.print(". Attempt ");
+  Serial.print(attemptNumber);
+  Serial.print(" of ");
+  Serial.println(MAX_HTTP_RETRY_ATTEMPTS);
+  if (reason.length() > 0) {
+    Serial.print("Reason: ");
+    Serial.println(reason);
+  }
+}
 
 // --- HELPER FUNCTION: Get the most recent statement date ---
 time_t getMostRecentDate(int target_day) {
@@ -118,6 +179,28 @@ String formatBalanceFloat(float val) {
   return finalStr;
 }
 
+// --- HELPER FUNCTION: Calculate next refresh time (2:00 AM or 2:00 PM) ---
+time_t getNextRefreshTime() {
+  time_t now;
+  time(&now);
+  struct tm nextRefresh = *localtime(&now);
+
+  // Snap to the hour first
+  nextRefresh.tm_min = 0;
+  nextRefresh.tm_sec = 0;
+
+  if (nextRefresh.tm_hour < 2) {
+    nextRefresh.tm_hour = 2;
+  } else if (nextRefresh.tm_hour < 14) {
+    nextRefresh.tm_hour = 14;
+  } else {
+    nextRefresh.tm_mday += 1;
+    nextRefresh.tm_hour = 2;
+  }
+
+  return mktime(&nextRefresh);
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -167,16 +250,20 @@ void setup() {
 
   Serial.println("Going to Deep Sleep...");
   
-  // Set ESP32 internal timer wakeup for 12 hours as a solid fallback for USB power
-  esp_sleep_enable_timer_wakeup(SLEEP_TIME);
-  
   time_t now;
   time(&now);
   struct tm * timeinfo = localtime(&now);
 
-  // If time is valid (year > 2020), set an absolute RTC alarm to bypass the 255-minute limit 
-  // of the M5Paper BM8563 relative timer.
+  // If time is valid (year > 2020), schedule next wake at 2:00 AM / 2:00 PM.
+  // Also configure ESP32 deep-sleep timer as fallback for USB power scenarios.
   if (timeinfo->tm_year > 120) {
+    time_t wakeup_t = getNextRefreshTime();
+    uint64_t sleepDurationSeconds = (wakeup_t > now) ? (uint64_t)(wakeup_t - now) : 60ULL;
+    uint64_t sleepDurationUs = sleepDurationSeconds * 1000000ULL;
+
+    // ESP32 timer fallback if RTC power-off sleep does not trigger as expected
+    esp_sleep_enable_timer_wakeup(sleepDurationUs);
+
     // Sync the hardware RTC with our NTP time
     m5::rtc_date_t rtc_date;
     rtc_date.year    = timeinfo->tm_year + 1900;
@@ -190,10 +277,12 @@ void setup() {
     rtc_time.seconds = timeinfo->tm_sec;
     
     M5.Rtc.setDateTime(&rtc_date, &rtc_time);
-
-    // Calculate wakeup time precisely 12 hours from now
-    time_t wakeup_t = now + (12 * 60 * 60);
     struct tm * wakeupinfo = localtime(&wakeup_t);
+
+    char wakeString[48];
+    strftime(wakeString, sizeof(wakeString), "%Y-%m-%d %I:%M %p", wakeupinfo);
+    Serial.print("Next scheduled refresh: ");
+    Serial.println(wakeString);
 
     m5::rtc_date_t wake_date;
     wake_date.date    = wakeupinfo->tm_mday;
@@ -203,11 +292,12 @@ void setup() {
     wake_time.hours   = wakeupinfo->tm_hour;
     wake_time.minutes = wakeupinfo->tm_min;
 
-    Serial.println("Using absolute RTC alarm for 12-hour true power-off.");
+    Serial.println("Using absolute RTC alarm for 2:00 AM / 2:00 PM schedule.");
     M5.Power.timerSleep(wake_date, wake_time);
   } else {
-    // If no NTP time (e.g., Wi-Fi failed), fallback to max relative sleep (will cap around 4.25h)
-    Serial.println("No valid time. Using relative RTC timer (caps around 4.25 hours).");
+    // If no NTP time (e.g., Wi-Fi failed), use fallback interval
+    esp_sleep_enable_timer_wakeup(FALLBACK_SLEEP_TIME_US);
+    Serial.println("No valid time. Using 12-hour fallback timer.");
     M5.Power.timerSleep((int)(12 * 60 * 60));
   }
 
@@ -242,17 +332,67 @@ void fetchAndDisplayBalance() {
   }
 
   Serial.println("Starting HTTPS connection to SimpleFIN...");
-  WiFiClientSecure *client = new WiFiClientSecure;
-  client->setInsecure(); 
+  int httpCode = 0;
+  String payload = "";
 
-  HTTPClient http;
-  http.begin(*client, requestUrl.c_str());
+  for (int attempt = 1; attempt <= MAX_HTTP_RETRY_ATTEMPTS; attempt++) {
+    if (!ensureWiFiConnected(WIFI_RECONNECT_TIMEOUT_MS)) {
+      httpCode = HTTPC_ERROR_CONNECTION_LOST;
+      if (attempt < MAX_HTTP_RETRY_ATTEMPTS) {
+        drawRetryStatus(httpCode, attempt, "Wi-Fi reconnect failed");
+        delay(HTTP_RETRY_DELAY_MS);
+        continue;
+      }
+      break;
+    }
 
-  Serial.println("Sending GET Request...");
-  int httpCode = http.GET();
-  
-  Serial.print("HTTP Response Code: ");
-  Serial.println(httpCode);
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(HTTP_READ_TIMEOUT_MS / 1000);
+
+    HTTPClient http;
+    http.setReuse(false);
+    http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+    http.setTimeout(HTTP_READ_TIMEOUT_MS);
+
+    if (!http.begin(client, requestUrl.c_str())) {
+      httpCode = HTTPC_ERROR_CONNECTION_REFUSED;
+      if (attempt < MAX_HTTP_RETRY_ATTEMPTS) {
+        drawRetryStatus(httpCode, attempt, "http.begin() failed");
+        delay(HTTP_RETRY_DELAY_MS);
+        continue;
+      }
+      break;
+    }
+
+    Serial.print("Sending GET Request (attempt ");
+    Serial.print(attempt);
+    Serial.print(" of ");
+    Serial.print(MAX_HTTP_RETRY_ATTEMPTS);
+    Serial.println(")...");
+
+    httpCode = http.GET();
+
+    Serial.print("HTTP Response Code: ");
+    Serial.println(httpCode);
+
+    if (httpCode == HTTP_CODE_OK) {
+      payload = http.getString();
+      http.end();
+      break;
+    }
+
+    http.end();
+
+    if (httpCode != HTTP_CODE_OK && attempt < MAX_HTTP_RETRY_ATTEMPTS) {
+      String reason = "Wi-Fi status: " + String((int)WiFi.status());
+      drawRetryStatus(httpCode, attempt, reason);
+      delay(HTTP_RETRY_DELAY_MS);
+      continue;
+    }
+
+    break;
+  }
 
   canvas.fillSprite(TFT_WHITE); 
 
@@ -287,7 +427,6 @@ void fetchAndDisplayBalance() {
 
   // --- PARSE AND DRAW THE DATA ---
   if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
     Serial.println("Received Payload:");
     Serial.println(payload);
     
@@ -304,8 +443,12 @@ void fetchAndDisplayBalance() {
       canvas.drawString(error.c_str(), 50, 150);
     } else {
       Serial.println("JSON Parsed Successfully.");
-      // Loop through accounts and draw cards
-      int y_offset = 60; // Start high enough for multiple cards
+      // Loop through accounts and draw compact cards (fit 3 on screen)
+      const int cardX = 50;
+      const int cardW = 860;
+      const int cardH = 145;
+      const int cardGap = 8;
+      int y_offset = 58;
       
       JsonArray accountsArray = doc["accounts"];
       for (JsonObject accountData : accountsArray) {
@@ -361,28 +504,28 @@ void fetchAndDisplayBalance() {
         time_t rawtime = (time_t)balanceDate;
         struct tm * timeinfo = localtime(&rawtime);
         char timeString[64];
-        strftime(timeString, sizeof(timeString), "(data provided on %b %d at %I:%M %p)", timeinfo);
+        strftime(timeString, sizeof(timeString), "as of %b %d (%I:%M %p)", timeinfo);
         
         struct tm * startinfo = localtime(&account_start_date);
-        char startString[64];
-        strftime(startString, sizeof(startString), "since %b %d (close of %b statement)", startinfo);
+        char startString[32];
+        strftime(startString, sizeof(startString), "since %b %d", startinfo);
 
-        canvas.drawRoundRect(50, y_offset, 860, 200, 15, TFT_BLACK); 
+        canvas.drawRoundRect(cardX, y_offset, cardW, cardH, 12, TFT_BLACK); 
         
-        canvas.setTextSize(3); // Reduced slightly for better fit
-        canvas.drawString(acctName, 80, y_offset + 15);
+        canvas.setTextSize(3);
+        canvas.drawString(acctName, 75, y_offset + 8);
 
-        canvas.setTextSize(7); // Reduced slightly for better fit
+        canvas.setTextSize(5);
         String mainAmountStr = formatBalanceFloat(this_month_balance);
-        canvas.drawString(mainAmountStr, 80, y_offset + 55);
+        canvas.drawString(mainAmountStr, 75, y_offset + 38);
         
         // Draw the "since" and "as of" time immediately after the balance amount in a smaller font
         int balanceWidth = canvas.textWidth(mainAmountStr);
         canvas.setTextSize(2);
+        canvas.setTextColor(TFT_BLACK);
+        canvas.drawString(String(startString), 75 + balanceWidth + 14, y_offset + 44);
         canvas.setTextColor(TFT_DARKGREY);
-        canvas.drawString(String(startString), 80 + balanceWidth + 15, y_offset + 70);
-        // canvas.setTextColor(TFT_DARKGREY);
-        canvas.drawString(timeString, 80 + balanceWidth + 15, y_offset + 95);
+        canvas.drawString(timeString, 75 + balanceWidth + 14, y_offset + 64);
         canvas.setTextColor(TFT_BLACK);
 
         if (statement_balance > 0.01) {
@@ -394,26 +537,23 @@ void fetchAndDisplayBalance() {
               " (Romney: " + formatBalanceFloat(romney_share) + 
               ", Ryan: " + formatBalanceFloat(ryan_share) + ")";
               
-          canvas.drawString("Statement Bal: " + statementAmountStr, 80, y_offset + 140);
+          canvas.drawString("Statement Bal: " + statementAmountStr, 75, y_offset + 94);
         } else {
-            // Push note higher if there is no statement balance
-            y_offset -= 25; 
+          canvas.setTextSize(2);
+          canvas.setTextColor(TFT_DARKGREY);
+          canvas.drawString("Statement Bal: $0.00", 75, y_offset + 94);
+          canvas.setTextColor(TFT_BLACK);
         }
         
         if (account_note.length() > 0) {
-          canvas.setTextColor(TFT_BLACK); // Slightly lighter to distinguish as a note
+          canvas.setTextColor(TFT_DARKGREY); // Slightly lighter to distinguish as a note
           canvas.setTextSize(2);
-          canvas.drawString(account_note, 80, y_offset + 165);
+          canvas.drawString(account_note, 75, y_offset + 116);
           canvas.setTextColor(TFT_BLACK); // Reset
         }
 
-        // Restore y_offset if we bumped it for the note layout
-        if (statement_balance <= 0.01) {
-            y_offset += 25;
-        }
-
         // Move to the next card's starting Y position
-        y_offset += 230; 
+        y_offset += (cardH + cardGap); 
       }
     }
   } else {
@@ -426,7 +566,4 @@ void fetchAndDisplayBalance() {
   Serial.println("Pushing graphic to E-Ink display...");
   canvas.pushSprite(0, 0);
   Serial.println("Display update complete.");
-
-  http.end();
-  delete client;
 }
